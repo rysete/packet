@@ -56,7 +56,25 @@ fn main() -> glib::ExitCode {
 
     glib::set_application_name(&gettext("Packet"));
 
-    let res = gio::Resource::load(RESOURCES_FILE).expect("Could not load gresource file");
+    // Load resources
+    let resources_file = if let Ok(mut path) = std::env::current_exe() {
+        path.pop();
+        path.push("resources.gresource");
+        if path.exists() {
+            path
+        } else {
+            RESOURCES_FILE.into()
+        }
+    } else {
+        RESOURCES_FILE.into()
+    };
+
+    let res = gio::Resource::load(&resources_file).unwrap_or_else(|_| {
+        panic!(
+            "Could not load gresource file: {}",
+            resources_file.to_str().unwrap_or_default()
+        )
+    });
     gio::resources_register(&res);
 
     let app = PacketApplication::default();
