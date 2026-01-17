@@ -19,6 +19,7 @@ use tokio_util::sync::CancellationToken;
 use crate::application::PacketApplication;
 use crate::config::{APP_ID, PROFILE};
 use crate::constants::packet_log_path;
+use crate::ext::MessageExt;
 use crate::objects::{self, SendRequestState};
 use crate::objects::{TransferState, UserAction};
 use crate::plugins::{FileBasedPlugin, NautilusPlugin, Plugin};
@@ -49,11 +50,11 @@ mod imp {
 
     use tokio::sync::Mutex;
 
-    use crate::utils::remove_notification;
+    use crate::{ext::MessageExt, utils::remove_notification};
 
     use super::*;
 
-    #[derive(Debug, gtk::CompositeTemplate, better_default::Default)]
+    #[derive(gtk::CompositeTemplate, better_default::Default)]
     #[template(resource = "/io/github/nozwock/Packet/ui/window.ui")]
     pub struct PacketApplicationWindow {
         #[default(gio::Settings::new(APP_ID))]
@@ -113,6 +114,10 @@ mod imp {
         #[template_child]
         pub nautilus_plugin_switch: TemplateChild<adw::SwitchRow>,
         pub nautilus_plugin_switch_handler_id: RefCell<Option<glib::SignalHandlerId>>,
+        #[template_child]
+        pub tray_icon_group: TemplateChild<adw::PreferencesGroup>,
+        #[template_child]
+        pub tray_icon_switch: TemplateChild<adw::SwitchRow>,
 
         #[template_child]
         pub main_box: TemplateChild<gtk::Box>,
@@ -177,6 +182,9 @@ mod imp {
         pub is_recipients_dialog_opened: Cell<bool>,
 
         pub nautilus_plugin: NautilusPlugin,
+
+        #[cfg(target_os = "linux")]
+        pub tray_icon_handle: RefCell<Option<ksni::Handle<crate::tray::Tray>>>,
     }
 
     #[glib::object_subclass]
@@ -210,11 +218,13 @@ mod imp {
             obj.load_app_state();
             obj.setup_gactions();
             obj.setup_preferences();
+            #[cfg(target_os = "linux")]
+            obj.setup_tray_icon();
             obj.setup_ui();
             obj.setup_connection_monitors();
             obj.setup_notification_actions_monitor();
             obj.setup_rqs_service();
-            obj.request_background();
+            obj.request_background_at_start();
         }
     }
 
@@ -247,8 +257,7 @@ mod imp {
                     .event()
                     .unwrap()
                     .msg
-                    .as_client()
-                    .expect("Cached TransferMessage is only of type User")
+                    .as_client_unchecked()
                     .state
                     .as_ref()
                     .unwrap_or(&TransferState::Initial)
@@ -306,7 +315,8 @@ mod imp {
 glib::wrapper! {
     pub struct PacketApplicationWindow(ObjectSubclass<imp::PacketApplicationWindow>)
         @extends gtk::Widget, gtk::Window, gtk::ApplicationWindow, adw::ApplicationWindow,
-        @implements gio::ActionMap, gio::ActionGroup, gtk::Root;
+        @implements gio::ActionGroup, gio::ActionMap, gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget,
+        gtk::Native, gtk::Root, gtk::ShortcutManager;
 }
 
 impl PacketApplicationWindow {
@@ -459,6 +469,9 @@ impl PacketApplicationWindow {
                 "active",
             )
             .build();
+        imp.settings
+            .bind("enable-tray-icon", &imp.tray_icon_switch.get(), "active")
+            .build();
 
         // TODO: The value of many preference options are only validated in the
         // UI, not outside of it.
@@ -567,6 +580,31 @@ impl PacketApplicationWindow {
         ));
         imp.nautilus_plugin_switch_handler_id
             .replace(Some(_signal_handle));
+
+        #[cfg(target_os = "linux")]
+        imp.tray_icon_switch.connect_active_notify(clone!(
+            #[weak]
+            imp,
+            move |switch| {
+                glib::spawn_future_local(clone!(
+                    #[weak]
+                    imp,
+                    #[weak]
+                    switch,
+                    async move {
+                        switch.set_sensitive(false);
+
+                        if switch.is_active() {
+                            _ = imp.obj().enable_tray_icon().await;
+                        } else {
+                            imp.obj().disable_tray_icon().await;
+                        }
+
+                        switch.set_sensitive(true);
+                    }
+                ));
+            }
+        ));
 
         let _signal_handle = imp.run_in_background_switch.connect_active_notify(clone!(
             #[weak]
@@ -965,12 +1003,15 @@ impl PacketApplicationWindow {
         }
     }
 
-    fn request_background(&self) {
+    fn request_background_at_start(&self) {
         glib::spawn_future_local(clone!(
             #[weak(rename_to = this)]
             self,
             async move {
                 let is_run_in_background = this.imp().settings.boolean("run-in-background");
+                if !is_run_in_background {
+                    return;
+                }
                 if let Some(response) = this.portal_request_background().await {
                     tracing::debug!(?response, "Background request successful");
 
@@ -981,7 +1022,7 @@ impl PacketApplicationWindow {
                             app.imp().start_in_background.replace(false);
                         }
                     }
-                } else if is_run_in_background {
+                } else {
                     this.add_toast(&gettext("Packet cannot run in the background"));
                 }
             }
@@ -1044,6 +1085,84 @@ impl PacketApplicationWindow {
                 };
             }
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    /// There's `tray-icon` for cross-platform systray support but on linux it still relies on gtk3 which doesn't
+    /// work with gtk4 environment.
+    ///
+    /// https://github.com/tauri-apps/tray-icon/pull/201
+    fn setup_tray_icon(&self) {
+        let imp = self.imp();
+
+        imp.tray_icon_group.set_visible(true);
+
+        let is_enable_tray_icon = imp.settings.boolean("enable-tray-icon");
+        tracing::debug!(?is_enable_tray_icon);
+        if is_enable_tray_icon {
+            self.enable_tray_icon();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn disable_tray_icon(&self) {
+        let imp = self.imp();
+
+        if let Some(ref mut handle) = *imp.tray_icon_handle.borrow_mut() {
+            tracing::debug!("Disabling tray icon");
+            handle.shutdown().await;
+        }
+        imp.tray_icon_handle.take();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn enable_tray_icon(&self) -> glib::JoinHandle<()> {
+        use crate::tray;
+        use ksni::*;
+
+        let imp = self.imp();
+
+        tracing::debug!("Enabling tray icon");
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<tray::TrayMessage>(1);
+        let handle = glib::spawn_future_local(clone!(
+            #[weak]
+            imp,
+            async move {
+                let tray = crate::tray::Tray { tx: tx };
+                let handle = if ashpd::is_sandboxed().await {
+                    tray.spawn_without_dbus_name().await
+                } else {
+                    tray.spawn().await
+                }
+                .inspect_err(
+                    |err| tracing::warn!(%err, "Failed to setup KStatusNotifierItem tray icon"),
+                )
+                .ok();
+                *imp.tray_icon_handle.borrow_mut() = handle;
+            }
+        ));
+
+        glib::spawn_future_local(clone!(
+            #[weak]
+            imp,
+            async move {
+                while let Some(msg) = rx.recv().await {
+                    match msg {
+                        tray::TrayMessage::OpenWindow => {
+                            imp.obj().present();
+                        }
+                        tray::TrayMessage::Quit => {
+                            imp.should_quit.replace(true);
+                            // FIXME: If preference window is opened, that window gets closed instead of
+                            // PacketApplicationWindow for some reason
+                            imp.obj().close();
+                        }
+                    }
+                }
+            }
+        ));
+
+        handle
     }
 
     fn setup_ui(&self) {
@@ -1351,23 +1470,12 @@ impl PacketApplicationWindow {
                     let widget =
                         widgets::create_file_card(&imp.obj(), &imp.manage_files_model, model_item);
 
-                    // TODO: Set activatable/focusable to false since they're
-                    // not being used here.
-                    //
-                    // The rows are also adds unnecessary steps in keyboard
-                    // navigation.
-                    //
-                    // Setting parent's property like this seemingly makes the
-                    // process crash silently
-                    //
-                    // widget.connect_parent_notify(|obj| {
-                    //     if let Some(row) = obj.parent().and_downcast_ref::<gtk::ListBoxRow>() {
-                    //         row.set_focusable(false);
-                    //         row.set_activatable(false);
-                    //     }
-                    // });
+                    // TODO: Should focusable be false too since it adds unnecessary steps in keyboard navigation?
+                    let row = gtk::ListBoxRow::new();
+                    row.set_activatable(false);
+                    row.set_child(Some(&widget));
 
-                    widget.into()
+                    row.into()
                 }
             ),
         );
@@ -1791,8 +1899,7 @@ impl PacketApplicationWindow {
                 .event()
                 .unwrap()
                 .msg
-                .as_client()
-                .unwrap()
+                .as_client_unchecked()
                 .state
                 .as_ref()
                 .unwrap_or(&rqs_lib::TransferState::Initial)
@@ -2146,7 +2253,7 @@ impl PacketApplicationWindow {
                         tracing::debug!(event = ?channel_message, "Received event on UI thread");
 
                         let id = &channel_message.id;
-                        let client_msg = channel_message.msg.as_client().unwrap();
+                        let client_msg = channel_message.msg.as_client_unchecked();
 
                         use rqs_lib::TransferState;
                         match client_msg

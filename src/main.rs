@@ -2,9 +2,12 @@ mod application;
 #[rustfmt::skip]
 mod config;
 mod constants;
+mod ext;
 mod monitors;
 mod objects;
 mod plugins;
+#[cfg(target_os = "linux")]
+mod tray;
 mod utils;
 mod widgets;
 mod window;
